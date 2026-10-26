@@ -116,12 +116,13 @@ struct Edge {
 std::vector<Edge> chips_to_edges(const std::vector<bool> &chips,
                                  uint32_t start_us = 1000,
                                  uint32_t jitter_us = 0,
-                                 unsigned seed = 0x5EED) {
+                                 unsigned seed = 0x5EED,
+                                 bool idle_level = false) {
   std::vector<Edge> edges;
   std::mt19937 rng(seed);
   std::uniform_int_distribution<int> jitter(-static_cast<int>(jitter_us),
                                             static_cast<int>(jitter_us));
-  bool prev = false;  // assume LOW pre-packet
+  bool prev = idle_level;  // line level before the packet's first chip
   uint32_t t = start_us;
   for (bool c : chips) {
     if (c != prev) {
@@ -269,6 +270,89 @@ TEST(round_trip_via_edges_with_jitter) {
   }
   EXPECT(st == ProFlame2Decoder::Status::kPacketReady,
          "edge-mode decode failed under realistic jitter");
+}
+
+// Same round-trip as round_trip_via_edges_no_jitter but the radio delivers
+// the stream complemented (GDO0 async polarity inverted — the reason
+// rtl_433_ESP / SmartRC expose a signal-invert option). The framer must
+// find the packet via the "0001" framing and produce identical fields.
+TEST(round_trip_via_edges_inverted_polarity) {
+  ProFlame2Decoder d;
+  const uint32_t serial = 0x07BE31u;
+  const auto chips = encode_packet_chips(serial, 0x83, 0x46, 0x0A, 0x02, 0x05,
+                                         0x0C);
+  std::vector<bool> inverted;
+  inverted.reserve(chips.size());
+  for (bool c : chips) {
+    inverted.push_back(!c);
+  }
+  // Inverted capture: the line idles HIGH (complement of the real idle
+  // LOW), so the packet's first edge is the HIGH→LOW transition at the
+  // sync marker's first chip.
+  const auto edges =
+      chips_to_edges(inverted, /*start_us=*/2000, /*jitter_us=*/0,
+                     /*seed=*/0x5EED, /*idle_level=*/true);
+
+  ProFlame2Decoder::Status st = ProFlame2Decoder::Status::kPending;
+  for (const auto &e : edges) {
+    st = d.ingest_edge(e.t_us, e.level_after);
+    if (st == ProFlame2Decoder::Status::kPacketReady) break;
+  }
+  EXPECT(st == ProFlame2Decoder::Status::kPacketReady,
+         "inverted-polarity edge stream did not decode");
+  const DecodedPacket &p = d.get_packet();
+  EXPECT(p.serial == serial, "serial mismatch on inverted stream");
+  EXPECT(p.cmd1 == 0x83, "cmd1 mismatch on inverted stream");
+  EXPECT(p.cmd2 == 0x46, "cmd2 mismatch on inverted stream");
+  EXPECT(p.c1 == 0x0A && p.d1 == 0x02, "c1/d1 mismatch on inverted stream");
+  EXPECT(p.c2 == 0x05 && p.d2 == 0x0C, "c2/d2 mismatch on inverted stream");
+  EXPECT(d.packets_inverted() == 1, "packets_inverted counter wrong: got %u",
+         d.packets_inverted());
+}
+
+// Issue #4 waveform: a raw pulse analyzer on an rtl_433 capture of a real
+// Thomas-Manchester ProFlame burst "guesses OOK_PWM" with s≈432 l≈840
+// y≈1244 — those are just the 1/2/3-chip run lengths of the 417 µs chip
+// (and 35 sync pulses = 5 repeats × 7 words). Feed a PWM-shaped edge
+// stream built from exactly those numbers through the decoder: it must NOT
+// produce a packet in either polarity. Guards both against future framing
+// regressions (hallucinating frames in PWM-shaped noise) and documents the
+// stance: a genuine PWM variant cannot decode here by construction.
+TEST(pwm_like_stream_is_rejected) {
+  ProFlame2Decoder d;
+  std::mt19937 rng(0xA11CE);
+  // Deterministic pseudo-random payload so pair-validation luck is tested,
+  // not one friendly bit pattern.
+  std::uniform_int_distribution<int> bit_dist(0, 1);
+
+  const uint32_t t_short = 432, t_long = 840, t_sync = 1244, t_gap = 5316;
+  uint32_t t = 2000;
+  bool level = false;
+  auto emit = [&](uint32_t width_us, bool lv) {
+    if (lv != level) {
+      d.ingest_edge(t, lv);
+      level = lv;
+    }
+    t += width_us;
+  };
+
+  for (int repeat = 0; repeat < 5; ++repeat) {
+    for (int word = 0; word < 7; ++word) {
+      emit(t_sync, true);   // sync pulse
+      emit(t_short, false); // return to low
+      for (int bit = 0; bit < 11; ++bit) {
+        const bool one = bit_dist(rng) != 0;
+        emit(one ? t_long : t_short, true);
+        emit(t_short, false);
+      }
+    }
+    emit(t_gap, false);  // inter-packet gap (< 6 ms burst-end threshold)
+  }
+  emit(8000, false);  // trailing silence closes the burst → run the framer
+
+  EXPECT(d.packets_emitted() == 0,
+         "PWM-shaped stream incorrectly produced %u packet(s)",
+         d.packets_emitted());
 }
 
 TEST(ecc_inversion_is_self_inverse) {

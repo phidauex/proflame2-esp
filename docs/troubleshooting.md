@@ -25,13 +25,20 @@
   for the mechanism and source citations.
 - **Pairing never converges** → confirm `gdo0_pin` is wired (plain ESP32
   builds RX-disabled by default), and that the OEM remote is held within
-  ~30 cm of the ESP32. Check the logs for `decode: chips=… pkts=…` lines —
-  `pkts > 0` means RX is working; if you see only `chips=…` without `pkts`,
-  there's a signal-quality issue. If you see `packets agree` lines but the
-  `distinct cmd1=N` or `cmd2=N` counter is stuck at 1, you're only pressing
-  buttons that affect one half of the packet — press something that changes
-  the other half (POWER/LIGHT/PILOT change `cmd1`; FLAME/FAN/SEC change
-  `cmd2`).
+  ~30 cm of the ESP32. Check the logs for the `RX 500ms:` + `decode:` pair
+  while pressing OEM remote buttons. Healthy capture: edges land mostly in
+  the `c1=`/`c2=` buckets (~417 µs / ~833 µs chip runs) and `pkts` climbs;
+  `inv=` > 0 just means the radio delivers the stream complemented — fine,
+  it still decodes. Edges almost all in `other=` with `pkts=0` means the
+  chip rate isn't matching (or the capture is AGC squelch noise, not the
+  remote — move closer). `pkts` climbing but `0 valid packets` persisting
+  per burst points at signal quality or a protocol variant; the
+  `pwm_like_stream_is_rejected` host test documents why PWM-shaped
+  captures cannot decode here by construction. If you see `packets agree`
+  lines but the `distinct cmd1=N` or `cmd2=N` counter is stuck at 1, you're
+  only pressing buttons that affect one half of the packet — press
+  something that changes the other half (POWER/LIGHT/PILOT change `cmd1`;
+  FLAME/FAN/SEC change `cmd2`).
 - **Pairing fails immediately with `ECC formula mismatch` in the log** →
   the on-device learn flow inverts each packet's checksum to recover the
   per-remote `(c, d)` constants, then validates that *different* button

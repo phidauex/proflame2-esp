@@ -77,9 +77,22 @@ void ProFlame2Decoder::invert_checksum(uint8_t cmd, uint8_t chk, uint8_t &c,
 }
 
 // Try to decode a 7-word packet starting at chip offset `start` in the bit
-// buffer. Returns true on success (last_packet_ populated, packets_emitted_
+// buffer. `inv` selects the read polarity: 0 reads the buffer as captured,
+// 1 reads it complemented. Inverted reads matter because the CC1101's async
+// GDO0 output presents the demodulator comparator directly — with ASK-style
+// capture the stream is often the logical complement of the transmitted
+// envelope (rtl_433_ESP and SmartRC both expose a signal-invert knob for
+// exactly this). A complemented stream turns the "1110" sync into "0001"
+// and swaps every Manchester pair, so a raw-polarity-only framer silently
+// yields zero packets on otherwise perfect RF.
+//
+// Every bit is read as `raw ^ inv`, which reconstructs the true chip stream
+// for either capture polarity, so sync/pair/parity/pad checks all validate
+// identically and last_packet_ carries identical field semantics.
+//
+// Returns true on success (last_packet_ populated, packets_emitted_
 // incremented); false on any framing/validation failure.
-bool ProFlame2Decoder::try_decode_packet_at_(size_t start) {
+bool ProFlame2Decoder::try_decode_packet_at_(size_t start, uint8_t inv) {
   if (start + kChipsPerPacket > bit_count_) {
     return false;
   }
@@ -90,8 +103,11 @@ bool ProFlame2Decoder::try_decode_packet_at_(size_t start) {
   size_t pos = start;
   for (size_t w = 0; w < kWordCount; w++) {
     // 4-chip sync = 1110 (S marker "11" + start_guard data bit "10").
-    if (!get_bit_(pos + 0) || !get_bit_(pos + 1) ||
-        !get_bit_(pos + 2) || get_bit_(pos + 3)) {
+    const bool s0 = static_cast<bool>(get_bit_(pos + 0) ^ inv);
+    const bool s1 = static_cast<bool>(get_bit_(pos + 1) ^ inv);
+    const bool s2 = static_cast<bool>(get_bit_(pos + 2) ^ inv);
+    const bool s3 = static_cast<bool>(get_bit_(pos + 3) ^ inv);
+    if (!s0 || !s1 || !s2 || s3) {
       return false;
     }
     pos += kSyncChips;
@@ -101,8 +117,8 @@ bool ProFlame2Decoder::try_decode_packet_at_(size_t start) {
     // else (00 or 11 mid-word) is a Manchester violation.
     uint16_t bits11 = 0;
     for (size_t b = 0; b < kDataBitsPerWord; b++) {
-      const bool a = get_bit_(pos);
-      const bool c = get_bit_(pos + 1);
+      const bool a = static_cast<bool>(get_bit_(pos) ^ inv);
+      const bool c = static_cast<bool>(get_bit_(pos + 1) ^ inv);
       pos += 2;
       if (!a && c) {
         bits11 = static_cast<uint16_t>(bits11 << 1);  // bit 0
@@ -112,6 +128,11 @@ bool ProFlame2Decoder::try_decode_packet_at_(size_t start) {
         return false;
       }
     }
+    // NOTE: no post-hoc bit inversion needed here. `raw ^ inv` restores the
+    // true chip stream (a complemented pair complemented-back reads as the
+    // original pair), so bits11 already holds true values and the
+    // parity/pad/end-guard validation below behaves exactly as in the raw
+    // case.
 
     // bits11 layout (MSB first): data[7:0] | pad | parity | end_guard.
     const uint8_t data = static_cast<uint8_t>((bits11 >> 3) & 0xFFu);
@@ -164,8 +185,15 @@ bool ProFlame2Decoder::try_decode_packet_at_(size_t start) {
 }
 
 // Walk the bit buffer looking for a valid 7-word packet at any starting
-// offset >= scan_start_offset_. Returns kPacketReady on the first match
-// (and advances scan_start_offset_ past it); kPending if none found.
+// offset >= scan_start_offset_, trying raw polarity first and inverted
+// second at each offset. Raw-first keeps true-positive cost identical to
+// the old single-pass scan (the extra inverted probe only runs where the
+// raw probe already failed at sync/word-1 — the overwhelmingly common
+// case is an early return on the 4-bit sync check). False-positive risk is
+// unchanged in practice: a stray "0001"-sync offset still has to pass 7
+// Manchester-valid words with 7 parity checks.
+// Returns kPacketReady on the first match (and advances scan_start_offset_
+// past it); kPending if none found.
 ProFlame2Decoder::Status ProFlame2Decoder::scan_framer_() {
   if (bit_count_ < kChipsPerPacket ||
       scan_start_offset_ + kChipsPerPacket > bit_count_) {
@@ -173,7 +201,16 @@ ProFlame2Decoder::Status ProFlame2Decoder::scan_framer_() {
   }
   const size_t end = bit_count_ - kChipsPerPacket;
   for (size_t start = scan_start_offset_; start <= end; start++) {
-    if (try_decode_packet_at_(start)) {
+    uint8_t inv = 0;
+    bool ok = try_decode_packet_at_(start, 0);
+    if (!ok) {
+      ok = try_decode_packet_at_(start, 1);
+      inv = 1;
+    }
+    if (ok) {
+      if (inv) {
+        packets_inverted_++;
+      }
       scan_start_offset_ = start + kChipsPerPacket;
       return Status::kPacketReady;
     }

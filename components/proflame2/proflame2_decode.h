@@ -13,7 +13,9 @@
 //        from a single jittered edge)
 //     -> on burst end (gap > 6 ms) or buffer-full: scan_framer_() walks the
 //        buffer offline, looking at every offset for the 4-chip "1110" sync
-//        followed by 11 Manchester-decoded data bits, repeated 7 times
+//        followed by 11 Manchester-decoded data bits, repeated 7 times, at
+//        either capture polarity (the CC1101 async output may present the
+//        stream complemented; both "1110" and "0001" framings decode)
 //     -> on a valid 7-word match: extract fields, run ECC inversion (direct
 //        algebra), publish DecodedPacket
 //
@@ -102,6 +104,12 @@ class ProFlame2Decoder {
   uint32_t bursts_decoded() const { return bursts_decoded_; }
   uint32_t bursts_failed() const { return bursts_failed_; }
   uint32_t packets_emitted() const { return packets_emitted_; }
+  // Of the emitted packets, how many were framed from an inverted-polarity
+  // GDO0 stream. Non-zero means the radio delivers the demodulated signal
+  // complemented (common with CC1101 async OOK capture); harmless, but a
+  // useful signal when triaging "hears edges but decodes nothing" reports
+  // for builds without this fallback.
+  uint32_t packets_inverted() const { return packets_inverted_; }
   uint32_t buffer_overflows() const { return buffer_overflows_; }
 
   // Helpers exposed for tests + ECC inversion reuse.
@@ -132,6 +140,7 @@ class ProFlame2Decoder {
   uint32_t bursts_decoded_{0};   // burst with at least one valid packet
   uint32_t bursts_failed_{0};    // burst that didn't yield a packet
   uint32_t packets_emitted_{0};
+  uint32_t packets_inverted_{0};  // ...framed from an inverted stream
   uint32_t buffer_overflows_{0};
 
   // Internal helpers.
@@ -139,7 +148,10 @@ class ProFlame2Decoder {
   bool get_bit_(size_t index) const;
   void set_bit_(size_t index, bool value);
   void append_chips_(bool level, uint32_t count);
-  bool try_decode_packet_at_(size_t start);
+  // inv=0 reads the buffer as-is; inv=1 reads it complemented (inverted
+  // GDO0 polarity). Returns true on a validated frame; last_packet_ holds
+  // TRUE field values either way.
+  bool try_decode_packet_at_(size_t start, uint8_t inv);
   Status scan_framer_();
 };
 
