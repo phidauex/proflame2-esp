@@ -120,12 +120,22 @@ void ProFlame2Component::service_rx_() {
   // flooding the API log with per-edge messages.
   static uint32_t window_start_ms = 0;
   static uint32_t edges_in_window = 0;
-  static uint32_t bucket_short = 0;   // 100..300 µs — single Manchester half-bit
-  static uint32_t bucket_long = 0;    // 300..600 µs — double half-bit
-  static uint32_t bucket_other = 0;   // anything else (mostly noise / silence)
+  // Buckets track the ProFlame 2 run-length structure, not arbitrary
+  // widths: at 2400 baud one chip is ~417 µs and Thomas-Manchester bursts
+  // produce edge spacings of 1 chip (417 µs), 2 chips (833 µs) and — for
+  // the "1110" sync marker — 3 chips (1244 µs). (An earlier calibration
+  // used 100–300/300–600 µs, i.e. a 4800-baud half-bit; it classified
+  // every edge of a *perfectly healthy* 2400-baud ProFlame signal as
+  // "other", which is what made issue #4 look like a modulation mismatch
+  // when the receiver was in fact seeing real frames.)
+  static uint32_t bucket_c1 = 0;    // 300..550 µs   — 1-chip run
+  static uint32_t bucket_c2 = 0;    // 550..1050 µs  — 2-chip run
+  static uint32_t bucket_c3 = 0;    // 1050..1550 µs — 3-chip run (sync)
+  static uint32_t bucket_other = 0; // sub-chip glitches, silences, noise
   // Decoder counter snapshots — diff against current to show per-window deltas.
   static uint32_t last_chips_ = 0;
   static uint32_t last_pkts_ = 0;
+  static uint32_t last_inv_ = 0;
   static uint32_t last_bursts_ok_ = 0;
   static uint32_t last_bursts_fail_ = 0;
   static uint32_t last_overflows_ = 0;
@@ -149,10 +159,12 @@ void ProFlame2Component::service_rx_() {
     }
 
     edges_in_window++;
-    if (dt >= 100 && dt <= 300) {
-      bucket_short++;
-    } else if (dt > 300 && dt <= 600) {
-      bucket_long++;
+    if (dt >= 300 && dt <= 550) {
+      bucket_c1++;
+    } else if (dt > 550 && dt <= 1050) {
+      bucket_c2++;
+    } else if (dt > 1050 && dt <= 1550) {
+      bucket_c3++;
     } else {
       bucket_other++;
     }
@@ -163,10 +175,11 @@ void ProFlame2Component::service_rx_() {
     this->rx_ring_tail_.store(tail, std::memory_order_release);
   }
 
-  // Periodic stats. Healthy ProFlame demodulation looks like a burst with
-  // many short+long buckets clustered around 200/400 µs. Lots of "other"
-  // (>600 µs gaps) with a sprinkle of short/long is noise — AGC chatter
-  // without real signal.
+  // Periodic stats. Healthy ProFlame demodulation looks like a burst whose
+  // edges cluster in the c1/c2/c3 buckets (~417/833/1244 µs, roughly
+  // 2:1:0.1 counts). Edges dominated by "other" with few c1/c2 hits is
+  // noise — AGC squelch chatter without real signal — or a chip-rate
+  // mismatch, not a modulation-variant mismatch.
   const uint32_t now = millis();
   if (window_start_ms == 0) {
     window_start_ms = now;
@@ -175,29 +188,33 @@ void ProFlame2Component::service_rx_() {
     if (edges_in_window > 0 && this->learn_state_ != LearnState::kIdle) {
       const uint32_t chips = this->learn_decoder_.chips_ingested();
       const uint32_t pkts = this->learn_decoder_.packets_emitted();
+      const uint32_t inv = this->learn_decoder_.packets_inverted();
       const uint32_t bursts_ok = this->learn_decoder_.bursts_decoded();
       const uint32_t bursts_fail = this->learn_decoder_.bursts_failed();
       const uint32_t overflows = this->learn_decoder_.buffer_overflows();
-      ESP_LOGI(TAG_RX, "RX 500ms: edges=%u short=%u long=%u other=%u",
+      ESP_LOGI(TAG_RX, "RX 500ms: edges=%u c1=%u c2=%u c3=%u other=%u",
                static_cast<unsigned>(edges_in_window),
-               static_cast<unsigned>(bucket_short),
-               static_cast<unsigned>(bucket_long),
+               static_cast<unsigned>(bucket_c1),
+               static_cast<unsigned>(bucket_c2),
+               static_cast<unsigned>(bucket_c3),
                static_cast<unsigned>(bucket_other));
       ESP_LOGI(TAG_RX,
-               "  decode: chips=%u pkts=%u bursts_ok=%u bursts_fail=%u overflows=%u",
+               "  decode: chips=%u pkts=%u inv=%u bursts_ok=%u bursts_fail=%u overflows=%u",
                static_cast<unsigned>(chips - last_chips_),
                static_cast<unsigned>(pkts - last_pkts_),
+               static_cast<unsigned>(inv - last_inv_),
                static_cast<unsigned>(bursts_ok - last_bursts_ok_),
                static_cast<unsigned>(bursts_fail - last_bursts_fail_),
                static_cast<unsigned>(overflows - last_overflows_));
       last_chips_ = chips;
       last_pkts_ = pkts;
+      last_inv_ = inv;
       last_bursts_ok_ = bursts_ok;
       last_bursts_fail_ = bursts_fail;
       last_overflows_ = overflows;
     }
     window_start_ms = now;
-    edges_in_window = bucket_short = bucket_long = bucket_other = 0;
+    edges_in_window = bucket_c1 = bucket_c2 = bucket_c3 = bucket_other = 0;
   }
 
   // Rate-limited overflow warning — don't spam if RX is mis-tuned. Peek

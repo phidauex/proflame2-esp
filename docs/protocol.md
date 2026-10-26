@@ -72,6 +72,28 @@ chip-rate-locked bit buffer. A linear scan of the buffer looks for the
 4-chip `1110` sync, Manchester-decodes 11 bits per word, and validates the
 7-word ProFlame frame.
 
+### Line-code polarity
+
+The CC1101 async GDO0 output presents the demodulator comparator directly,
+and with ASK-style capture the delivered stream is sometimes the logical
+complement of the transmitted envelope (this is why `rtl_433_ESP` and
+SmartRC-CC1101-Driver-Lib both expose a signal-invert option). The framer
+is polarity-independent: at every offset it probes the raw `1110` sync
+first and the complemented `0001` framing second, so both capture
+polarities decode to identical field values. The `inv=` counter in the
+periodic `decode:` log line reports how many packets were framed from an
+inverted stream — useful triage data, never a problem by itself.
+
+Note on the "some remotes are OOK_PWM not Manchester" claim (issue #4):
+raw pulse analysis of a real Thomas-Manchester ProFlame burst *guesses*
+`OOK_PWM, s=432 l=840 y=1244` — those are exactly the 1-chip, 2-chip and
+3-chip (sync) run-lengths of the 417 µs chip, and the "sync count" is one
+pulse per word per repeat. rtl_433 decodes the same capture with its own
+Thomas-Manchester ProFlame2 driver. A genuine PWM line code cannot produce
+a balanced-chip `1110` sync, valid 11-pair Manchester words *and* correct
+checksums, so the framer deliberately never decodes PWM-shaped signals
+(guarded by a host test).
+
 This is fundamentally more robust than per-edge streaming decode under WiFi
 ISR jitter — chip phase is anchored to chip-rate time, not edge time, so a
 single jittered edge can no longer permanently desync alignment.
